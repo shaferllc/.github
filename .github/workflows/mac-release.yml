@@ -1,0 +1,224 @@
+name: Mac release
+
+# The shared release for shaferllc Mac apps: every app's own release.yml calls
+# this (copy workflow-templates/mac-release.yml). One place to fix signing.
+#
+# What it needs from the app repo:
+#   VERSION                 the version; bumping it on main cuts a release
+#   ./make-app.sh --dist    builds a universal dist/<app>.app. Its own signing
+#                           doesn't matter: it runs with SIGN_IDENTITY= and the
+#                           app is re-signed here.
+#   <app>.entitlements      optional. The hardened runtime (which notarization
+#                           requires) denies Apple Events, camera, microphone,
+#                           calendars, location… unless entitled here.
+#
+# Signs all code in the bundle with the Developer ID (hardened runtime, secure
+# timestamp), notarizes and staples the app, builds the .zip and .dmg,
+# notarizes and staples the .dmg, checks it the way a downloader would, and
+# publishes <app>-<v>.dmg, <app>-<v>.zip, and a stable-named <app>.dmg so
+# releases/latest/download/<app>.dmg survives version bumps.
+#
+# Secrets (org level): DEVELOPER_ID_P12, DEVELOPER_ID_P12_PASSWORD,
+# NOTARY_API_KEY, NOTARY_API_KEY_ID, NOTARY_API_ISSUER. Callers pass them with
+# `secrets: inherit`.
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: The app's name, as in dist/<app>.app and <app>.entitlements
+        type: string
+        required: true
+      notes:
+        description: Opening paragraph of the release notes
+        type: string
+        default: ''
+      dry_run:
+        description: Build, sign, notarize and verify, but publish nothing
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    runs-on: macos-26
+    permissions:
+      contents: write
+    env:
+      APP: ${{ inputs.app }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the VERSION file
+        id: v
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Has this version already shipped?
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then
+            echo "Dry run of v$V: building, signing and notarizing; publishing nothing."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "v$V" >/dev/null 2>&1; then
+            echo "v$V is already released — nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$V is new — building."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Releases never ship unnotarized: a missing secret fails here rather than
+      # publishing an ad-hoc build. The certificate lives in a throwaway keychain.
+      - name: Load the Developer ID certificate and notary key
+        if: steps.gate.outputs.build == 'true'
+        env:
+          CERT_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.NOTARY_API_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          for v in CERT_P12 CERT_PASSWORD NOTARY_KEY NOTARY_KEY_ID NOTARY_ISSUER; do
+            [ -n "${!v:-}" ] || { echo "::error::Secret for $v is not set. Does this repo have access to the shaferllc signing secrets? (Re-run Shafer Signing Setup.)"; exit 1; }
+          done
+
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          KC_PASS="$(uuidgen)"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KC" >/dev/null
+          # Unquoted on purpose: each existing keychain path is its own argument.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+
+          printf '%s' "$NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool store-credentials shafer --keychain "$KC" \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER"
+          rm "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/notary.p8"
+
+          ID=$(security find-identity -v -p codesigning "$KC" | sed -nE 's/.*"(Developer ID Application: [^"]+)".*/\1/p' | head -1)
+          [ -n "$ID" ] || { echo "::error::DEVELOPER_ID_P12 has no Developer ID Application identity"; exit 1; }
+          echo "SIGN_ID=$ID" >> "$GITHUB_ENV"
+          # Prove Apple accepts the key before any build time is spent.
+          xcrun notarytool history --keychain-profile shafer >/dev/null
+
+      - name: Build the universal app
+        if: steps.gate.outputs.build == 'true'
+        # An empty SIGN_IDENTITY keeps make-app.sh's own signing ad-hoc; the next step re-signs.
+        run: SIGN_IDENTITY='' VERSION="${{ steps.v.outputs.version }}" ./make-app.sh --dist
+
+      - name: Sign, notarize and package
+        if: steps.gate.outputs.build == 'true'
+        env:
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          BUNDLE="dist/$APP.app"
+          test -d "$BUNDLE" || { echo "::error::./make-app.sh --dist didn't produce $BUNDLE"; exit 1; }
+
+          sign() { codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$@"; }
+          notarize() {
+            local out id status
+            out=$(xcrun notarytool submit "$1" --keychain-profile shafer --wait --output-format json) || true
+            echo "$out"
+            id=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
+            status=$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null || true)
+            if [ "$status" != Accepted ]; then
+              [ -n "$id" ] && xcrun notarytool log "$id" --keychain-profile shafer || true
+              echo "::error::Apple didn't accept $1 (status: ${status:-none})"
+              exit 1
+            fi
+          }
+
+          # Inside out: find -depth lists what's inside a folder before the
+          # folder, so nested code is signed before whatever contains it. Then
+          # the app itself, which carries the entitlements.
+          find "$BUNDLE/Contents" -depth \( -type f -o -type d \( -name '*.framework' -o -name '*.app' -o -name '*.appex' -o -name '*.xpc' -o -name '*.bundle' \) \) -print0 |
+            while IFS= read -r -d '' f; do
+              if [ -d "$f" ] || file -b "$f" | grep -q 'Mach-O'; then
+                echo "› signing ${f#dist/}"
+                sign "$f"
+              fi
+            done
+          # <app>.entitlements at the repo root, any case (jetsam.entitlements for Jetsam).
+          ENT=$(find . -maxdepth 1 -iname "$APP.entitlements" | head -1)
+          if [ -n "$ENT" ]; then
+            echo "› signing $APP.app with $ENT"
+            sign --entitlements "$ENT" "$BUNDLE"
+          else
+            echo "› signing $APP.app (no $APP.entitlements)"
+            sign "$BUNDLE"
+          fi
+          codesign --verify --deep --strict --verbose=2 "$BUNDLE"
+
+          /usr/bin/ditto -c -k --keepParent "$BUNDLE" "$RUNNER_TEMP/notarize.zip"
+          notarize "$RUNNER_TEMP/notarize.zip"
+          xcrun stapler staple "$BUNDLE"
+
+          # Repackage from the signed, stapled app — make-app.sh's copies hold the ad-hoc build.
+          rm -f dist/*.zip dist/*.dmg
+          /usr/bin/ditto -c -k --keepParent "$BUNDLE" "dist/$APP-$V.zip"
+          ROOT="$RUNNER_TEMP/dmg-root"
+          rm -rf "$ROOT" && mkdir "$ROOT"
+          /usr/bin/ditto "$BUNDLE" "$ROOT/$APP.app"
+          ln -s /Applications "$ROOT/Applications"
+          /usr/bin/hdiutil create -volname "$APP $V" -srcfolder "$ROOT" -ov -format UDZO "dist/$APP-$V.dmg"
+          codesign --force --timestamp --sign "$SIGN_ID" "dist/$APP-$V.dmg"
+          notarize "dist/$APP-$V.dmg"
+          xcrun stapler staple "dist/$APP-$V.dmg"
+
+      - name: Verify the disk image
+        if: steps.gate.outputs.build == 'true'
+        env:
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          DMG="dist/$APP-$V.dmg"
+          EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "dist/$APP.app/Contents/Info.plist")
+          # Both architectures, or the download is broken for every Intel Mac.
+          lipo -archs "dist/$APP.app/Contents/MacOS/$EXE" | tee /dev/stderr | grep -q x86_64
+          lipo -archs "dist/$APP.app/Contents/MacOS/$EXE" | grep -q arm64
+          # Mount it the way a downloader would.
+          hdiutil attach "$DMG" -nobrowse -quiet -mountpoint /tmp/dmg
+          A="/tmp/dmg/$APP.app"
+          test -x "$A/Contents/MacOS/$EXE"
+          test -L /tmp/dmg/Applications
+          codesign --verify --deep --strict "$A"
+          codesign -dvv "$A" 2>&1 | grep -q "Authority=Developer ID Application"
+          # A stapled ticket is what lets it open offline with no Gatekeeper prompt.
+          xcrun stapler validate "$A"
+          spctl --assess --type execute --verbose "$A"
+          hdiutil detach /tmp/dmg -quiet
+          xcrun stapler validate "$DMG"
+
+      - name: Keep the dry run's disk image
+        if: steps.gate.outputs.build == 'true' && inputs.dry_run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app }}-dry-run
+          path: dist/${{ inputs.app }}-*.dmg
+
+      - name: Publish the release
+        if: steps.gate.outputs.build == 'true' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          cp "dist/$APP-$V.dmg" "dist/$APP.dmg"
+          {
+            if [ -n "$NOTES" ]; then printf '%s\n\n' "$NOTES"; fi
+            printf '%s\n' "**Install:** download the \`.dmg\`, open it, and drag \`$APP.app\` to the \`Applications\` folder beside it. (The \`.zip\` is the same app, if you prefer it.) Universal — Apple Silicon and Intel. Signed with a Developer ID and notarized by Apple, so it opens normally."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "v$V" "dist/$APP-$V.dmg" "dist/$APP.dmg" "dist/$APP-$V.zip" \
+            --target "$GITHUB_SHA" \
+            --title "$APP v$V" \
+            --notes-file "$RUNNER_TEMP/notes.md"

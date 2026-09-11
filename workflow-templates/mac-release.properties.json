@@ -1,0 +1,6 @@
+{
+  "name": "Mac app release (signed + notarized)",
+  "description": "Bump VERSION on main to publish a Developer ID signed, notarized .dmg and .zip through the shared shaferllc Mac release.",
+  "categories": ["Swift"],
+  "filePatterns": ["^make-app\\.sh$", "^Package\\.swift$"]
+}
