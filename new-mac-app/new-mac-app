@@ -1,0 +1,116 @@
+#!/bin/bash
+# new-mac-app — scaffold a Shafer LLC Mac app wired for shafer.llc
+# registration and the shared signed + notarized release, then put it on GitHub.
+#
+#   new-mac-app Name "One sentence about what it does." [--private] [--local]
+#
+#   --private   create a private repo. On GitHub's free plan org secrets don't
+#               reach private repos: re-run Shafer Signing Setup afterwards.
+#   --local     scaffold, build and test only — no GitHub repo, no site entry.
+#
+# What it does:
+#   1. copies template/ to $APPS_DIR/<slug>, filling in the name, slug,
+#      description and year
+#   2. swift build, swift test, and a universal ./make-app.sh --dist
+#   3. git init + first commit
+#   4. creates shaferllc/<slug> and pushes — VERSION is 0.1.0, so that push
+#      cuts the first notarized release through shaferllc/.github's mac-release
+#   5. adds <slug> to shafer.llc's config/products.php and commits it (push the
+#      site yourself to deploy)
+set -euo pipefail
+
+ORG=shaferllc
+APPS_DIR="${APPS_DIR:-$HOME/Projects/Apps/desktop}"
+SITE_DIR="${SITE_DIR:-$HOME/Projects/shaferllc}"
+TEMPLATE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/template"
+
+die() { echo "✗ $*" >&2; exit 1; }
+say() { printf '\n\033[1m› %s\033[0m\n' "$*"; }
+
+NAME="${1:-}"; DESC="${2:-}"
+[ -n "$NAME" ] && [ -n "$DESC" ] || die 'usage: new-mac-app Name "One sentence about it." [--private] [--local]'
+shift 2
+VISIBILITY=public; LOCAL=0
+for arg in "$@"; do
+  case "$arg" in
+    --private) VISIBILITY=private ;;
+    --local)   LOCAL=1 ;;
+    *) die "unknown option: $arg" ;;
+  esac
+done
+
+[[ "$NAME" =~ ^[A-Z][A-Za-z0-9]+$ ]] || die "Name must be one capitalized word, like Swab or Wheelhouse."
+SLUG=$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')
+DEST="$APPS_DIR/$SLUG"
+[ -e "$DEST" ] && die "$DEST already exists."
+[ -d "$TEMPLATE" ] || die "template not found at $TEMPLATE"
+if [ "$LOCAL" = 0 ]; then
+  command -v gh >/dev/null || die "GitHub CLI (gh) isn't installed."
+  gh repo view "$ORG/$SLUG" >/dev/null 2>&1 && die "github.com/$ORG/$SLUG already exists."
+  grep -q "'$SLUG' => \[" "$SITE_DIR/config/products.php" && die "'$SLUG' is already a product in $SITE_DIR/config/products.php."
+fi
+
+say "Scaffolding $NAME in $DEST"
+mkdir -p "$APPS_DIR"
+cp -R "$TEMPLATE" "$DEST"
+# Paths first (deepest first, so a renamed folder's children are already done)…
+find "$DEST" -depth -name '*__APP__*' | while IFS= read -r p; do
+  mv "$p" "$(dirname "$p")/$(basename "$p" | sed "s/__APP__/$NAME/g")"
+done
+# …then contents. Values come in through the environment, so a description with
+# slashes, quotes or ampersands can't break the substitution.
+export APP="$NAME" SLUG DESC YEAR="$(date +%Y)"
+grep -rlE '__(APP|SLUG|DESC|YEAR)__' "$DEST" | while IFS= read -r f; do
+  perl -pi -e 's/__APP__/$ENV{APP}/g; s/__SLUG__/$ENV{SLUG}/g; s/__DESC__/$ENV{DESC}/g; s/__YEAR__/$ENV{YEAR}/g' "$f"
+done
+chmod +x "$DEST/make-app.sh"
+
+say "Building and testing"
+cd "$DEST"
+swift build
+swift test
+SIGN_IDENTITY='' VERSION=0.0.0-scaffold ./make-app.sh --dist
+rm -rf dist
+
+say "First commit"
+git init -q -b main
+git add -A
+git commit -q -m "$NAME: scaffold from new-mac-app
+
+$DESC"
+echo "✓ $(git log --oneline -1)"
+
+if [ "$LOCAL" = 1 ]; then
+  say "Done (local only). Open it: ./make-app.sh builds, installs and launches $NAME."
+  exit 0
+fi
+
+# The first release needs the signing secrets, which only reach every public
+# repo once Shafer Signing Setup has set them org-wide.
+vis=$(gh secret list --org "$ORG" --json name,visibility -q '.[]|select(.name=="DEVELOPER_ID_P12")|.visibility' 2>/dev/null || true)
+if [ "$VISIBILITY" = private ] || [ "$(printf '%s' "$vis" | tr '[:upper:]' '[:lower:]')" != all ]; then
+  echo "⚠︎ The signing secrets won't reach $ORG/$SLUG yet ($VISIBILITY repo; secrets visible to: ${vis:-unknown})."
+  echo "  Its first release will stop at signing. Re-run Shafer Signing Setup, then re-run the Release workflow."
+fi
+
+say "Creating github.com/$ORG/$SLUG ($VISIBILITY) and pushing"
+gh repo create "$ORG/$SLUG" "--$VISIBILITY" --description "$DESC" --source . --remote origin --push
+
+say "Adding $SLUG to shafer.llc"
+PRODUCTS="$SITE_DIR/config/products.php"
+if [ -f "$PRODUCTS" ]; then
+  export ORG
+  # Insert before the array's closing "];".
+  perl -0pi -e 's/\n\];\s*\z/\n\n    \x27$ENV{SLUG}\x27 => [\n        \x27name\x27 => \x27$ENV{APP}\x27,\n        \x27mode\x27 => \x27free\x27,\n        \x27url_scheme\x27 => \x27$ENV{SLUG}\x27,\n        \x27download\x27 => \x27https:\/\/github.com\/$ENV{ORG}\/$ENV{SLUG}\/releases\/latest\/download\/$ENV{APP}.dmg\x27,\n    ],\n];\n/' "$PRODUCTS"
+  grep -q "'$SLUG' => \[" "$PRODUCTS" || die "couldn't add $SLUG to $PRODUCTS — add it by hand."
+  git -C "$SITE_DIR" add config/products.php
+  git -C "$SITE_DIR" commit -q -m "Offer $NAME for registration" -- config/products.php
+  echo "✓ committed in $SITE_DIR — push to deploy:  git -C \"$SITE_DIR\" push"
+else
+  echo "⚠︎ $PRODUCTS not found; add '$SLUG' there by hand."
+fi
+
+say "Done"
+echo "  Repo:     https://github.com/$ORG/$SLUG"
+echo "  Release:  https://github.com/$ORG/$SLUG/actions/workflows/release.yml  (v0.1.0, signed + notarized)"
+echo "  Next:     cd \"$DEST\" && ./make-app.sh   # build, install and launch"
