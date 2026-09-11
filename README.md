@@ -17,7 +17,12 @@ stable-named `<App>.dmg`.
 new-mac-app Name "One sentence about what it does."            # public repo
 new-mac-app Name "…" --private                                   # private repo
 new-mac-app Name "…" --local                                     # no GitHub, no site
+new-mac-app Name "…" --publish                                   # ship a --local scaffold once it's built out
 ```
+
+In Claude Code, `/new-app` does the whole thing: `--local`, builds the features
+you describe (entitlements, icon, tests), then `--publish`, so the first
+notarized release is the real app rather than the placeholder.
 
 [`new-mac-app/new-mac-app`](new-mac-app/new-mac-app) (linked into
 `~/.local/bin`) copies [`new-mac-app/template`](new-mac-app/template) to

@@ -2,11 +2,14 @@
 # new-mac-app — scaffold a Shafer LLC Mac app wired for shafer.llc
 # registration and the shared signed + notarized release, then put it on GitHub.
 #
-#   new-mac-app Name "One sentence about what it does." [--private] [--local]
+#   new-mac-app Name "One sentence about what it does." [--private] [--local | --publish]
 #
 #   --private   create a private repo. On GitHub's free plan org secrets don't
 #               reach private repos: re-run Shafer Signing Setup afterwards.
 #   --local     scaffold, build and test only — no GitHub repo, no site entry.
+#   --publish   for an app scaffolded with --local and since built out: skip
+#               the scaffold, check it's committed, build and test it, then do
+#               the GitHub and site steps — so the first release is the real app.
 #
 # What it does:
 #   1. copies template/ to $APPS_DIR/<slug>, filling in the name, slug,
@@ -30,25 +33,40 @@ say() { printf '\n\033[1m› %s\033[0m\n' "$*"; }
 NAME="${1:-}"; DESC="${2:-}"
 [ -n "$NAME" ] && [ -n "$DESC" ] || die 'usage: new-mac-app Name "One sentence about it." [--private] [--local]'
 shift 2
-VISIBILITY=public; LOCAL=0
+VISIBILITY=public; LOCAL=0; PUBLISH=0
 for arg in "$@"; do
   case "$arg" in
     --private) VISIBILITY=private ;;
     --local)   LOCAL=1 ;;
+    --publish) PUBLISH=1 ;;
     *) die "unknown option: $arg" ;;
   esac
 done
+[ "$LOCAL" = 1 ] && [ "$PUBLISH" = 1 ] && die "--local and --publish are opposites; pick one."
 
 [[ "$NAME" =~ ^[A-Z][A-Za-z0-9]+$ ]] || die "Name must be one capitalized word, like Swab or Wheelhouse."
 SLUG=$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')
 DEST="$APPS_DIR/$SLUG"
-[ -e "$DEST" ] && die "$DEST already exists."
+if [ "$PUBLISH" = 1 ]; then
+  [ -d "$DEST/.git" ] || die "$DEST isn't a scaffolded app — run with --local first."
+else
+  [ -e "$DEST" ] && die "$DEST already exists."
+fi
 [ -d "$TEMPLATE" ] || die "template not found at $TEMPLATE"
 if [ "$LOCAL" = 0 ]; then
   command -v gh >/dev/null || die "GitHub CLI (gh) isn't installed."
   gh repo view "$ORG/$SLUG" >/dev/null 2>&1 && die "github.com/$ORG/$SLUG already exists."
   grep -q "'$SLUG' => \[" "$SITE_DIR/config/products.php" && die "'$SLUG' is already a product in $SITE_DIR/config/products.php."
 fi
+
+if [ "$PUBLISH" = 1 ]; then
+  # Already scaffolded and built out: ship what's committed, nothing else.
+  cd "$DEST"
+  [ -z "$(git status --porcelain)" ] || die "$DEST has uncommitted changes — commit them first."
+  say "Building and testing $NAME"
+  swift build
+  swift test
+else
 
 say "Scaffolding $NAME in $DEST"
 mkdir -p "$APPS_DIR"
@@ -59,7 +77,8 @@ find "$DEST" -depth -name '*__APP__*' | while IFS= read -r p; do
 done
 # …then contents. Values come in through the environment, so a description with
 # slashes, quotes or ampersands can't break the substitution.
-export APP="$NAME" SLUG DESC YEAR="$(date +%Y)"
+YEAR=$(date +%Y)
+export APP="$NAME" SLUG DESC YEAR
 grep -rlE '__(APP|SLUG|DESC|YEAR)__' "$DEST" | while IFS= read -r f; do
   perl -pi -e 's/__APP__/$ENV{APP}/g; s/__SLUG__/$ENV{SLUG}/g; s/__DESC__/$ENV{DESC}/g; s/__YEAR__/$ENV{YEAR}/g' "$f"
 done
@@ -79,6 +98,8 @@ git commit -q -m "$NAME: scaffold from new-mac-app
 
 $DESC"
 echo "✓ $(git log --oneline -1)"
+
+fi   # end of the scaffold (skipped by --publish)
 
 if [ "$LOCAL" = 1 ]; then
   say "Done (local only). Open it: ./make-app.sh builds, installs and launches $NAME."
