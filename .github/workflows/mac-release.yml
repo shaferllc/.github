@@ -11,6 +11,11 @@ name: Mac release
 #   <app>.entitlements      optional. The hardened runtime (which notarization
 #                           requires) denies Apple Events, camera, microphone,
 #                           calendars, location… unless entitled here.
+#   sparkle-public-key      optional. An app that links Sparkle keeps its
+#                           SUPublicEDKey here; with it, the release also signs
+#                           the .zip for Sparkle and attaches appcast.xml, so
+#                           releases/latest/download/appcast.xml (the app's
+#                           SUFeedURL) always describes the newest version.
 #
 # Signs all code in the bundle with the Developer ID (hardened runtime, secure
 # timestamp), notarizes and staples the app, builds the .zip and .dmg,
@@ -19,8 +24,9 @@ name: Mac release
 # releases/latest/download/<app>.dmg survives version bumps.
 #
 # Secrets (org level): DEVELOPER_ID_P12, DEVELOPER_ID_P12_PASSWORD,
-# NOTARY_API_KEY, NOTARY_API_KEY_ID, NOTARY_API_ISSUER. Callers pass them with
-# `secrets: inherit`.
+# NOTARY_API_KEY, NOTARY_API_KEY_ID, NOTARY_API_ISSUER, and
+# SPARKLE_ED_PRIVATE_KEY for apps with a sparkle-public-key. Callers pass them
+# with `secrets: inherit`.
 
 on:
   workflow_call:
@@ -222,3 +228,61 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "$APP v$V" \
             --notes-file "$RUNNER_TEMP/notes.md"
+
+      # Sparkle's update feed, for apps that ship an updater. The release is
+      # already out, so a missing key warns rather than fails.
+      - name: Publish the Sparkle appcast
+        if: steps.gate.outputs.build == 'true' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+          SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          # Only sign_update is used; its EdDSA signature doesn't depend on the
+          # Sparkle version the app links.
+          SPARKLE_VERSION: 2.9.6
+        run: |
+          set -euo pipefail
+          if [ ! -s sparkle-public-key ]; then
+            echo "No sparkle-public-key, so no updater: skipping the appcast."; exit 0
+          fi
+          if [ -z "$SPARKLE_KEY" ]; then
+            echo "::warning::$APP has a sparkle-public-key but SPARKLE_ED_PRIVATE_KEY isn't set: v$V has no appcast, so installed copies won't see it."
+            exit 0
+          fi
+
+          mkdir -p "$RUNNER_TEMP/sparkle"
+          curl -fsSL "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz" \
+            | tar -xJ -C "$RUNNER_TEMP/sparkle"
+          printf '%s' "$SPARKLE_KEY" > "$RUNNER_TEMP/ed25519"
+          # The notarized .zip the release just published. Prints: sparkle:edSignature="…" length="…"
+          SIGNATURE=$("$RUNNER_TEMP/sparkle/bin/sign_update" --ed-key-file "$RUNNER_TEMP/ed25519" "dist/$APP-$V.zip")
+          rm "$RUNNER_TEMP/ed25519"
+
+          # Sparkle compares sparkle:version with the installed CFBundleVersion,
+          # so read both back from the bundle that shipped, never recompute them.
+          PLIST="dist/$APP.app/Contents/Info.plist"
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")
+          MIN_OS=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$PLIST")
+          REPO="https://github.com/$GITHUB_REPOSITORY"
+
+          cat > "$RUNNER_TEMP/appcast.xml" <<XML
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+              <title>$APP</title>
+              <item>
+                <title>$APP $V</title>
+                <pubDate>$(date -R)</pubDate>
+                <sparkle:version>$BUILD</sparkle:version>
+                <sparkle:shortVersionString>$V</sparkle:shortVersionString>
+                <sparkle:minimumSystemVersion>$MIN_OS</sparkle:minimumSystemVersion>
+                <link>$REPO/releases/tag/v$V</link>
+                <enclosure url="$REPO/releases/download/v$V/$APP-$V.zip"
+                           type="application/octet-stream" $SIGNATURE />
+              </item>
+            </channel>
+          </rss>
+          XML
+          xmllint --noout "$RUNNER_TEMP/appcast.xml"
+          echo "› appcast.xml: build $BUILD, v$V"
+          gh release upload "v$V" "$RUNNER_TEMP/appcast.xml"
